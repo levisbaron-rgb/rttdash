@@ -1,126 +1,141 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Streamlit Geofence Clustering App with Outlier Filtering and Convex Hull Polygons
-"""
-
 import streamlit as st
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.cluster import KMeans
-import folium
-from streamlit_folium import st_folium
-from shapely.geometry import MultiPoint, Polygon
+import plotly.express as px
 
-st.set_page_config(page_title="Geofence Clustering", layout="centered")
-st.title("Acelera Manual Strategies, VROOM VROOM | Use template: 104650 ")
+# Force Wide Layout
+st.set_page_config(layout="wide", page_title="Operational Dashboard")
 
-# Predefined named colors for clusters
-named_colors = [
-    "red", "blue", "green", "orange", "purple",
-    "cyan", "magenta", "brown", "pink", "gray"
-]
+# --- CUSTOM CSS: Orange Shadows, High Contrast, and Sidebar ---
+st.markdown("""
+    <style>
+        .stApp { background-color: #ffffff; }
+        [data-testid="stSidebar"] { background-color: #ffffff; border-right: 1px solid #f0f0f0; }
+        
+        /* The "Squares" with Orange Shadow & Higher Contrast Border */
+        .metric-container {
+            background-color: #fff4f0; 
+            border-radius: 16px;
+            padding: 25px;
+            border: 2px solid #ffccbc;
+            box-shadow: 0 10px 25px rgba(255, 75, 17, 0.1); /* Subtle orange glow */
+            margin-bottom: 25px;
+        }
 
-# Upload file
-uploaded_file = st.file_uploader("Upload your data file CSV or Excel", type=["csv", "xlsx"])
+        /* Ensure Table Index (First Column) is wide and readable */
+        [data-testid="stTable"] th, [data-testid="stTable"] td {
+            min-width: 200px !important;
+        }
+        
+        h1, h2, h3, h4 { color: #000000 !important; font-weight: 800 !important; }
+    </style>
+""", unsafe_allow_html=True)
 
-if uploaded_file:
-    # Read and clean data
-    if uploaded_file.name.endswith('.csv'):
+st.title("Operational Insights Dashboard")
+
+# --- 1. Data Loading ---
+st.sidebar.markdown("### 🟠 Data Management")
+uploaded_file = st.sidebar.file_uploader("Upload CSV", type=["csv"])
+
+if uploaded_file is not None:
+    try:
         df = pd.read_csv(uploaded_file)
-    else:
-        df = pd.read_excel(uploaded_file)
+        df.columns = df.columns.str.strip()
+        df['start_date'] = pd.to_datetime(df['start_date'])
+        df['day of the week'] = df['start_date'].dt.day_name()
 
-    df = df.dropna(subset=['lat', 'lng', 'completion_rate'])
-    st.success("File uploaded and cleaned!")
+        # --- 2. Filters ---
+        city_options = sorted(df['city_name'].dropna().unique().tolist())
+        selected_city = st.sidebar.selectbox("City Select", ['All'] + city_options)
+        
+        graph_df = df.copy()
+        if selected_city != 'All': graph_df = graph_df[graph_df['city_name'] == selected_city]
 
-    # Feature selection
-    clustering_cols = st.multiselect(
-        "Select features to use for clustering :) | If first try not satisfying try removing completion rate",
-        options=df.columns.tolist(),
-        default=["lat", "lng", "orders_initial", "completion_rate"]
-    )
+        selected_stage = st.sidebar.selectbox("Stage for Averages", ['All'] + sorted(df['stage'].unique().tolist()))
+        avg_df = graph_df.copy()
+        if selected_stage != 'All': avg_df = avg_df[avg_df['stage'] == selected_stage]
 
-    if clustering_cols:
-        # Normalize & cluster
-        scaler = MinMaxScaler()
-        scaled_features = scaler.fit_transform(df[clustering_cols])
+        dist_df = graph_df[graph_df['stage'] == 1].copy()
 
-        n_clusters = st.slider("Select number of clusters | Recommended amount is 4", 2, 10, 4)
-        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-        df['cluster'] = kmeans.fit_predict(scaled_features)
+        if not avg_df.empty:
+            # --- 3. Calculation Helper ---
+            days_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+            
+            def get_metrics_table(data_avg, data_dist, col_name, prefix):
+                stats = data_avg.groupby('day of the week')[col_name].agg(['mean', 'max', 'min']).transpose()
+                qs = [0, 0.1, 0.2, 0.5, 0.7, 0.9, 1.0]
+                bins = sorted(data_dist[col_name].quantile(qs).unique())
+                if len(bins) < 2: return None
+                
+                labels = [f"Drivers {prefix} {bins[i]:.2f}-{bins[i+1]:.2f} (%)" for i in range(len(bins)-1)]
+                data_dist['bin'] = pd.cut(data_dist[col_name], bins=bins, labels=labels, include_lowest=True)
+                
+                grouped = data_dist.groupby(['day of the week', 'bin'], observed=False)['driver_num_treatment'].sum().reset_index()
+                totals = data_dist.groupby('day of the week')['driver_num_treatment'].sum().reset_index().rename(columns={'driver_num_treatment': 'total'})
+                merged = pd.merge(grouped, totals, on='day of the week')
+                merged['percent'] = (merged['driver_num_treatment'] / merged['total'] * 100).fillna(0)
+                
+                dist_table = merged.pivot(index='bin', columns='day of the week', values='percent').fillna(0)
+                available = [d for d in days_order if d in stats.columns]
+                return pd.concat([stats[available].rename(index={'mean':'Avg', 'max':'Max', 'min':'Min'}), dist_table[available]])
 
-        # Assign colors
-        cluster_colors = {i: named_colors[i % len(named_colors)] for i in range(n_clusters)}
+            tph_final = get_metrics_table(avg_df, dist_df, 'tph', 'TPH')
+            rpt_final = get_metrics_table(avg_df, dist_df, 'rpt', 'RPT')
 
-        # Cluster summary
-        st.subheader("Cluster Summary")
-        summary = df.groupby('cluster').agg({
-            'completion_rate': 'mean',
-            'orders_initial': 'mean'
-        }).reset_index()
+            # --- 4. Side-by-Side Tables with Contrast ---
+            col_left, col_right = st.columns(2)
 
-        summary['color'] = summary['cluster'].map(cluster_colors)
-        summary.rename(columns={
-            'completion_rate': 'avg_completion_rate',
-            'orders_initial': 'avg_orders_initial'
-        }, inplace=True)
+            def format_table(df, is_money_table=False):
+                formatted = df.copy().astype(object)
+                for r in df.index:
+                    for c in df.columns:
+                        val = df.loc[r, c]
+                        if r in ['Avg', 'Max', 'Min']:
+                            formatted.at[r, c] = f"{int(val)}$" if is_money_table else f"{val:.2f}"
+                        else:
+                            formatted.at[r, c] = f"{val:.1f}%"
+                return formatted
 
-        st.dataframe(summary)
+            with col_left:
+                st.markdown('<div class="metric-container">', unsafe_allow_html=True)
+                st.markdown("### 📈 TPH Performance")
+                # Using st.table for fixed-width columns that don't cut text
+                st.table(format_table(tph_final, False))
+                st.markdown('</div>', unsafe_allow_html=True)
 
-        # Show polygon coordinates per cluster
-        st.subheader("Cluster Polygon Coordinates (Copy and Paste them in Duse-Eye)")
-        for cluster_id in sorted(df['cluster'].unique()):
-            cluster_df = df[df['cluster'] == cluster_id][['lat', 'lng']].copy()
+            with col_right:
+                st.markdown('<div class="metric-container">', unsafe_allow_html=True)
+                st.markdown("### 💰 RPT Performance")
+                st.table(format_table(rpt_final, True))
+                st.markdown('</div>', unsafe_allow_html=True)
 
-            # Calculate centroid and distance
-            centroid = cluster_df[['lat', 'lng']].mean().values
-            cluster_df['dist'] = np.sqrt((cluster_df['lat'] - centroid[0])**2 + (cluster_df['lng'] - centroid[1])**2)
+            st.markdown("---")
 
-            # Remove top 2% farthest points (outliers)
-            filtered_cluster = cluster_df[cluster_df['dist'] <= cluster_df['dist'].quantile(0.98)]
+            # --- 5. Visualizations (Plotly with Axis Labels) ---
+            g_col1, g_col2 = st.columns(2)
+            stage_stats = graph_df.groupby('stage')[['tph', 'rpt']].mean().reset_index()
 
-            if len(filtered_cluster) < 3:
-                st.warning(f"Cluster {cluster_id} doesn't have enough non-outlier points for a polygon.")
-                continue
+            with g_col1:
+                st.markdown('<div class="metric-container">', unsafe_allow_html=True)
+                fig_tph = px.bar(stage_stats, x='stage', y='tph', 
+                                 title="Avg TPH per Stage",
+                                 labels={'stage': 'Operational Stage', 'tph': 'Average Trips Per Hour (TPH)'},
+                                 color_discrete_sequence=['#FF4B11'])
+                fig_tph.update_layout(plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)')
+                st.plotly_chart(fig_tph, use_container_width=True)
+                st.markdown('</div>', unsafe_allow_html=True)
 
-            # Convex hull
-            cluster_points = filtered_cluster[['lng', 'lat']].values
-            hull = MultiPoint(cluster_points).convex_hull
-            coords = list(hull.exterior.coords) if hull.geom_type == 'Polygon' else list(hull.coords)
-            coord_text = "\n".join([f"{lng:.6f}, {lat:.6f}" for lng, lat in coords])
+            with g_col2:
+                st.markdown('<div class="metric-container">', unsafe_allow_html=True)
+                fig_rpt = px.bar(stage_stats, x='stage', y='rpt', 
+                                 title="Avg RPT per Stage",
+                                 labels={'stage': 'Operational Stage', 'rpt': 'Average Reward Per Trip (RPT)'},
+                                 color_discrete_sequence=['#FF4B11'])
+                fig_rpt.update_layout(plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)')
+                st.plotly_chart(fig_rpt, use_container_width=True)
+                st.markdown('</div>', unsafe_allow_html=True)
 
-            with st.expander(f"Cluster {cluster_id} ({cluster_colors[cluster_id]}) Polygon Coordinates"):
-                st.text_area("Copy-paste friendly coordinates (lat, lng):", coord_text, height=200)
-
-        # Cluster map
-        st.subheader("Cluster Map")
-        m = folium.Map(location=[df['lat'].mean(), df['lng'].mean()], zoom_start=12)
-
-        for cluster_id in df['cluster'].unique():
-            cluster_df = df[df['cluster'] == cluster_id][['lat', 'lng']].copy()
-
-            # Reapply outlier filtering
-            centroid = cluster_df[['lat', 'lng']].mean().values
-            cluster_df['dist'] = np.sqrt((cluster_df['lat'] - centroid[0])**2 + (cluster_df['lng'] - centroid[1])**2)
-            filtered_cluster = cluster_df[cluster_df['dist'] <= cluster_df['dist'].quantile(0.98)]
-
-            if len(filtered_cluster) < 3:
-                continue
-
-            points = list(zip(filtered_cluster['lat'], filtered_cluster['lng']))
-            hull = MultiPoint(points).convex_hull
-
-            if isinstance(hull, Polygon):
-                folium.Polygon(
-                    locations=[(lat, lng) for lat, lng in hull.exterior.coords],
-                    color=cluster_colors[cluster_id],
-                    fill=True,
-                    fill_color=cluster_colors[cluster_id],
-                    fill_opacity=0.3,
-                    weight=2,
-                    popup=f"Cluster {cluster_id}"
-                ).add_to(m)
-
-        st_folium(m, width=700, height=500)
+    except Exception as e:
+        st.error(f"Error: {e}")
+else:
+    st.info("Please upload your CSV file to continue.")
