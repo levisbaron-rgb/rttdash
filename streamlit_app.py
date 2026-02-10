@@ -4,7 +4,7 @@ import numpy as np
 import plotly.express as px
 
 # Force Wide Layout
-st.set_page_config(layout="wide", page_title="DIP Deep Dive | Use:107183 ")
+st.set_page_config(layout="wide", page_title="DIP Deep Dive | Use:107183")
 
 # --- CUSTOM CSS: Neutral Text (No Green) & Orange Glow ---
 st.markdown("""
@@ -40,7 +40,7 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-st.title("Insights")
+st.title("DIP Deep Dive | Use:107183")
 
 # --- 1. Data Loading (Changed to Excel) ---
 uploaded_file = st.sidebar.file_uploader("Upload Excel File", type=["xlsx", "xls"])
