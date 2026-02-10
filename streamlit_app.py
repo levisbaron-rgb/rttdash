@@ -4,7 +4,7 @@ import numpy as np
 import plotly.express as px
 
 # Force Wide Layout
-st.set_page_config(layout="wide", page_title="Operational Dashboard")
+st.set_page_config(layout="wide", page_title="DIP Deep Dive | Use:107183 ")
 
 # --- CUSTOM CSS: Neutral Text (No Green) & Orange Glow ---
 st.markdown("""
@@ -41,7 +41,7 @@ st.markdown("""
     </style>
 """, unsafe_allow_html=True)
 
-st.title("Operational Insights Dashboard")
+st.title("Insights")
 
 # --- 1. Data Loading ---
 uploaded_file = st.sidebar.file_uploader("Upload CSV", type=["csv"])
