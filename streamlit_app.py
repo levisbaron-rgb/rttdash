@@ -1,9 +1,3 @@
-#!/usr/bin/env python3
-# -*- coding: utf-8 -*-
-"""
-Streamlit Geofence Clustering App with Outlier Filtering and Convex Hull Polygons
-"""
-
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -14,113 +8,142 @@ from streamlit_folium import st_folium
 from shapely.geometry import MultiPoint, Polygon
 
 st.set_page_config(page_title="Geofence Clustering", layout="centered")
-st.title("Acelera Manual Strategies, VROOM VROOM | Use template: 104650 ")
+st.title("Acelera Manual Strategies, VROOM VROOM | Use template: 104650")
 
 # Predefined named colors for clusters
 named_colors = [
     "red", "blue", "green", "orange", "purple",
-    "cyan", "magenta", "brown", "pink", "gray"
+    "cyan", "magenta", "darkred", "cadetblue", "darkgreen"
 ]
 
 # Upload file
 uploaded_file = st.file_uploader("Upload your data file CSV or Excel", type=["csv", "xlsx"])
 
 if uploaded_file:
-    # Read and clean data
+    # 1. READ DATA
     if uploaded_file.name.endswith('.csv'):
         df = pd.read_csv(uploaded_file)
     else:
         df = pd.read_excel(uploaded_file)
 
+    # 2. DATA CLEANING (Fixed: Removed regex=True to prevent \N interpretation error)
+    # We replace common SQL/Data null strings with actual NaN
+    df = df.replace([r'\\N', r'\N', 'None', 'null', 'nan'], np.nan)
+
+    # Convert essential columns to numeric (coercing errors to NaN)
+    # This is the 'safety net'—anything that isn't a number becomes NaN here
+    cols_to_fix = ['lat', 'lng', 'completion_rate', 'orders_initial']
+    for col in cols_to_fix:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    # Drop rows that are missing coordinates or completion rates
     df = df.dropna(subset=['lat', 'lng', 'completion_rate'])
-    st.success("File uploaded and cleaned!")
 
-    # Feature selection
-    clustering_cols = st.multiselect(
-        "Select features to use for clustering :) | If first try not satisfying try removing completion rate",
-        options=df.columns.tolist(),
-        default=["lat", "lng", "orders_initial", "completion_rate"]
-    )
+    if df.empty:
+        st.error(r"Wait! After cleaning the '\N' values, the dataset is empty. Check your file.")
+    else:
+        st.success(f"File uploaded and cleaned! {len(df)} rows ready for clustering.")
 
-    if clustering_cols:
-        # Normalize & cluster
-        scaler = MinMaxScaler()
-        scaled_features = scaler.fit_transform(df[clustering_cols])
+        # 3. FEATURE SELECTION
+        clustering_cols = st.multiselect(
+            "Select features to use for clustering :)",
+            options=df.columns.tolist(),
+            default=["lat", "lng", "orders_initial", "completion_rate"]
+        )
 
-        n_clusters = st.slider("Select number of clusters | Recommended amount is 4", 2, 10, 4)
-        kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-        df['cluster'] = kmeans.fit_predict(scaled_features)
+        if clustering_cols:
+            # Normalize & Cluster
+            scaler = MinMaxScaler()
+            temp_df = df.dropna(subset=clustering_cols).copy()
+            
+            scaled_features = scaler.fit_transform(temp_df[clustering_cols])
 
-        # Assign colors
-        cluster_colors = {i: named_colors[i % len(named_colors)] for i in range(n_clusters)}
+            n_clusters = st.slider("Select number of clusters | Recommended amount is 4", 2, 10, 4)
+            kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
+            temp_df['cluster'] = kmeans.fit_predict(scaled_features)
 
-        # Cluster summary
-        st.subheader("Cluster Summary")
-        summary = df.groupby('cluster').agg({
-            'completion_rate': 'mean',
-            'orders_initial': 'mean'
-        }).reset_index()
+            # Assign colors
+            cluster_colors = {i: named_colors[i % len(named_colors)] for i in range(n_clusters)}
 
-        summary['color'] = summary['cluster'].map(cluster_colors)
-        summary.rename(columns={
-            'completion_rate': 'avg_completion_rate',
-            'orders_initial': 'avg_orders_initial'
-        }, inplace=True)
+            # 4. CLUSTER SUMMARY
+            st.subheader("Cluster Summary")
+            summary = temp_df.groupby('cluster').agg({
+                'completion_rate': 'mean',
+                'orders_initial': 'mean'
+            }).reset_index()
 
-        st.dataframe(summary)
+            summary['color'] = summary['cluster'].map(cluster_colors)
+            summary.rename(columns={
+                'completion_rate': 'avg_completion_rate',
+                'orders_initial': 'avg_orders_initial'
+            }, inplace=True)
 
-        # Show polygon coordinates per cluster
-        st.subheader("Cluster Polygon Coordinates (Copy and Paste them in Duse-Eye)")
-        for cluster_id in sorted(df['cluster'].unique()):
-            cluster_df = df[df['cluster'] == cluster_id][['lat', 'lng']].copy()
+            st.dataframe(summary)
 
-            # Calculate centroid and distance
-            centroid = cluster_df[['lat', 'lng']].mean().values
-            cluster_df['dist'] = np.sqrt((cluster_df['lat'] - centroid[0])**2 + (cluster_df['lng'] - centroid[1])**2)
+            # 5. POLYGON GENERATION
+            st.subheader("Cluster Polygon Coordinates (Copy and Paste them in Duse-Eye)")
+            
+            polygons_to_draw = []
 
-            # Remove top 2% farthest points (outliers)
-            filtered_cluster = cluster_df[cluster_df['dist'] <= cluster_df['dist'].quantile(0.98)]
+            for cluster_id in sorted(temp_df['cluster'].unique()):
+                cluster_points_df = temp_df[temp_df['cluster'] == cluster_id][['lat', 'lng']].copy()
 
-            if len(filtered_cluster) < 3:
-                st.warning(f"Cluster {cluster_id} doesn't have enough non-outlier points for a polygon.")
-                continue
+                # Calculate centroid and distance for outlier filtering
+                centroid = cluster_points_df[['lat', 'lng']].mean().values
+                cluster_points_df['dist'] = np.sqrt(
+                    (cluster_points_df['lat'] - centroid[0])**2 + 
+                    (cluster_points_df['lng'] - centroid[1])**2
+                )
 
-            # Convex hull
-            cluster_points = filtered_cluster[['lng', 'lat']].values
-            hull = MultiPoint(cluster_points).convex_hull
-            coords = list(hull.exterior.coords) if hull.geom_type == 'Polygon' else list(hull.coords)
-            coord_text = "\n".join([f"{lng:.6f}, {lat:.6f}" for lng, lat in coords])
+                # Remove top 2% farthest points (outliers)
+                filtered_cluster = cluster_points_df[
+                    cluster_points_df['dist'] <= cluster_points_df['dist'].quantile(0.98)
+                ]
 
-            with st.expander(f"Cluster {cluster_id} ({cluster_colors[cluster_id]}) Polygon Coordinates"):
-                st.text_area("Copy-paste friendly coordinates (lat, lng):", coord_text, height=200)
+                if len(filtered_cluster) < 3:
+                    continue
 
-        # Cluster map
-        st.subheader("Cluster Map")
-        m = folium.Map(location=[df['lat'].mean(), df['lng'].mean()], zoom_start=12)
+                # Create Convex Hull
+                points_array = filtered_cluster[['lng', 'lat']].values
+                hull = MultiPoint(points_array).convex_hull
+                
+                if isinstance(hull, Polygon):
+                    coords = list(hull.exterior.coords)
+                    polygons_to_draw.append((cluster_id, hull))
+                else:
+                    coords = list(hull.coords)
+                
+                coord_text = "\n".join([f"{lat:.6f}, {lng:.6f}" for lng, lat in coords])
 
-        for cluster_id in df['cluster'].unique():
-            cluster_df = df[df['cluster'] == cluster_id][['lat', 'lng']].copy()
+                with st.expander(f"Cluster {cluster_id} ({cluster_colors[cluster_id]}) Coordinates"):
+                    st.text_area("Copy-paste friendly (lat, lng):", coord_text, height=150, key=f"txt_{cluster_id}")
 
-            # Reapply outlier filtering
-            centroid = cluster_df[['lat', 'lng']].mean().values
-            cluster_df['dist'] = np.sqrt((cluster_df['lat'] - centroid[0])**2 + (cluster_df['lng'] - centroid[1])**2)
-            filtered_cluster = cluster_df[cluster_df['dist'] <= cluster_df['dist'].quantile(0.98)]
+            # 6. MAP VISUALIZATION
+            st.subheader("Cluster Map")
+            m = folium.Map(location=[temp_df['lat'].mean(), temp_df['lng'].mean()], zoom_start=12)
 
-            if len(filtered_cluster) < 3:
-                continue
+            # Add markers
+            for _, row in temp_df.iterrows():
+                folium.CircleMarker(
+                    location=[row['lat'], row['lng']],
+                    radius=3,
+                    color=cluster_colors[int(row['cluster'])],
+                    fill=True,
+                    fill_opacity=0.7
+                ).add_to(m)
 
-            points = list(zip(filtered_cluster['lat'], filtered_cluster['lng']))
-            hull = MultiPoint(points).convex_hull
-
-            if isinstance(hull, Polygon):
+            # Add Polygons
+            for cluster_id, hull in polygons_to_draw:
+                map_coords = [(lat, lng) for lng, lat in hull.exterior.coords]
                 folium.Polygon(
-                    locations=[(lat, lng) for lat, lng in hull.exterior.coords],
+                    locations=map_coords,
                     color=cluster_colors[cluster_id],
                     fill=True,
                     fill_color=cluster_colors[cluster_id],
                     fill_opacity=0.3,
-                    weight=2,
-                    popup=f"Cluster {cluster_id}"
+                    weight=3,
+                    popup=f"Geofence {cluster_id}"
                 ).add_to(m)
 
-        st_folium(m, width=700, height=500)
+            st_folium(m, width=700, height=500)
