@@ -1,149 +1,161 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.cluster import KMeans
-import folium
-from streamlit_folium import st_folium
-from shapely.geometry import MultiPoint, Polygon
 
-st.set_page_config(page_title="Geofence Clustering", layout="centered")
-st.title("Acelera Manual Strategies, VROOM VROOM | Use template: 104650")
+# Force Wide Layout
+st.set_page_config(layout="wide", page_title="DIP Stage Comparison | Use:107183")
 
-# Predefined named colors for clusters
-named_colors = [
-    "red", "blue", "green", "orange", "purple",
-    "cyan", "magenta", "darkred", "cadetblue", "darkgreen"
-]
+# --- CUSTOM CSS ---
+st.markdown("""
+    <style>
+        .stApp { background-color: #ffffff; }
+        .header-block {
+            background-color: #FF4B11;
+            color: white !important;
+            padding: 12px 20px;
+            border-radius: 8px 8px 0px 0px;
+            font-weight: 800;
+            margin-top: 20px;
+            display: flex;
+            align-items: center;
+        }
+        .content-container {
+            background-color: #fff4f0; 
+            border-radius: 0px 0px 12px 12px;
+            padding: 20px;
+            border: 2px solid #ffccbc;
+            box-shadow: 0 10px 20px rgba(255, 75, 17, 0.08);
+            margin-bottom: 30px;
+        }
+        [data-testid="stDataFrame"] th:first-child { min-width: 450px !important; }
+    </style>
+""", unsafe_allow_html=True)
 
-# Upload file
-uploaded_file = st.file_uploader("Upload your data file CSV or Excel", type=["csv", "xlsx"])
+st.title("DIP Deep Dive: Multi-Stage Analysis Use Template: 107183")
 
-if uploaded_file:
-    # 1. READ DATA
-    if uploaded_file.name.endswith('.csv'):
-        df = pd.read_csv(uploaded_file)
-    else:
-        df = pd.read_excel(uploaded_file)
+# --- 1. Data Loading ---
+uploaded_file = st.sidebar.file_uploader("Upload Excel File", type=["xlsx", "xls", "csv"])
 
-    # 2. DATA CLEANING (Fixed: Removed regex=True to prevent \N interpretation error)
-    # We replace common SQL/Data null strings with actual NaN
-    df = df.replace([r'\\N', r'\N', 'None', 'null', 'nan'], np.nan)
+if uploaded_file is not None:
+    try:
+        # Check file type for proper loading
+        if uploaded_file.name.endswith('.csv'):
+            df = pd.read_csv(uploaded_file)
+        else:
+            df = pd.read_excel(uploaded_file, engine='openpyxl')
+        
+        df.columns = df.columns.str.strip()
+        df['start_date'] = pd.to_datetime(df['start_date'], errors='coerce')
+        df = df.dropna(subset=['start_date'])
+        
+        days_order = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday', 'Sunday']
+        df['day of the week'] = pd.Categorical(df['start_date'].dt.day_name(), categories=days_order, ordered=True)
 
-    # Convert essential columns to numeric (coercing errors to NaN)
-    # This is the 'safety net'—anything that isn't a number becomes NaN here
-    cols_to_fix = ['lat', 'lng', 'completion_rate', 'orders_initial']
-    for col in cols_to_fix:
-        if col in df.columns:
-            df[col] = pd.to_numeric(df[col], errors='coerce')
+        city_options = sorted(df['city_name'].dropna().unique().tolist())
+        selected_city = st.sidebar.selectbox("City Select", ['All'] + city_options)
+        
+        working_df = df.copy()
+        if selected_city != 'All': 
+            working_df = working_df[working_df['city_name'] == selected_city]
 
-    # Drop rows that are missing coordinates or completion rates
-    df = df.dropna(subset=['lat', 'lng', 'completion_rate'])
-
-    if df.empty:
-        st.error(r"Wait! After cleaning the '\N' values, the dataset is empty. Check your file.")
-    else:
-        st.success(f"File uploaded and cleaned! {len(df)} rows ready for clustering.")
-
-        # 3. FEATURE SELECTION
-        clustering_cols = st.multiselect(
-            "Select features to use for clustering :)",
-            options=df.columns.tolist(),
-            default=["lat", "lng", "orders_initial", "completion_rate"]
-        )
-
-        if clustering_cols:
-            # Normalize & Cluster
-            scaler = MinMaxScaler()
-            temp_df = df.dropna(subset=clustering_cols).copy()
+        # --- 2. Calculation Logic ---
+        def get_metrics_table(stage_data, col_name, is_rpt=False):
+            if stage_data.empty: return None
             
-            scaled_features = scaler.fit_transform(temp_df[clustering_cols])
-
-            n_clusters = st.slider("Select number of clusters | Recommended amount is 4", 2, 10, 4)
-            kmeans = KMeans(n_clusters=n_clusters, random_state=42, n_init=10)
-            temp_df['cluster'] = kmeans.fit_predict(scaled_features)
-
-            # Assign colors
-            cluster_colors = {i: named_colors[i % len(named_colors)] for i in range(n_clusters)}
-
-            # 4. CLUSTER SUMMARY
-            st.subheader("Cluster Summary")
-            summary = temp_df.groupby('cluster').agg({
-                'completion_rate': 'mean',
-                'orders_initial': 'mean'
-            }).reset_index()
-
-            summary['color'] = summary['cluster'].map(cluster_colors)
-            summary.rename(columns={
-                'completion_rate': 'avg_completion_rate',
-                'orders_initial': 'avg_orders_initial'
-            }, inplace=True)
-
-            st.dataframe(summary)
-
-            # 5. POLYGON GENERATION
-            st.subheader("Cluster Polygon Coordinates (Copy and Paste them in Duse-Eye)")
+            # Base Stats
+            stats = stage_data.groupby('day of the week', observed=False)[col_name].agg(['mean', 'max', 'min']).transpose()
+            stats.index = ['Avg', 'Max', 'Min']
             
-            polygons_to_draw = []
+            temp_df = stage_data.copy()
 
-            for cluster_id in sorted(temp_df['cluster'].unique()):
-                cluster_points_df = temp_df[temp_df['cluster'] == cluster_id][['lat', 'lng']].copy()
-
-                # Calculate centroid and distance for outlier filtering
-                centroid = cluster_points_df[['lat', 'lng']].mean().values
-                cluster_points_df['dist'] = np.sqrt(
-                    (cluster_points_df['lat'] - centroid[0])**2 + 
-                    (cluster_points_df['lng'] - centroid[1])**2
-                )
-
-                # Remove top 2% farthest points (outliers)
-                filtered_cluster = cluster_points_df[
-                    cluster_points_df['dist'] <= cluster_points_df['dist'].quantile(0.98)
-                ]
-
-                if len(filtered_cluster) < 3:
-                    continue
-
-                # Create Convex Hull
-                points_array = filtered_cluster[['lng', 'lat']].values
-                hull = MultiPoint(points_array).convex_hull
+            if not is_rpt:
+                # FIXED RANGES FOR TPH
+                tph_bins = [0, 0.5, 1.0, 1.5, 2.0, 2.5, 3.0, 100] # Added overflow bin
+                tph_labels = ["(%) Drivers TPH (0 - 0.5)", "(%) Drivers TPH (0.5 - 1)", 
+                              "(%) Drivers TPH (1 - 1.5)", "(%) Drivers TPH (1.5 - 2)", 
+                              "(%) Drivers TPH (2 - 2.5)", "(%) Drivers TPH (2.5 - 3)",
+                              "(%) Drivers TPH (> 3.0)"]
                 
-                if isinstance(hull, Polygon):
-                    coords = list(hull.exterior.coords)
-                    polygons_to_draw.append((cluster_id, hull))
-                else:
-                    coords = list(hull.coords)
-                
-                coord_text = "\n".join([f"{lat:.6f}, {lng:.6f}" for lng, lat in coords])
+                temp_df['bin'] = pd.cut(temp_df[col_name], bins=tph_bins, labels=tph_labels, include_lowest=True)
+                dist_df = temp_df.dropna(subset=['bin'])
+            else:
+                # PERCENTILE BINS FOR RPT
+                try:
+                    _, bins = pd.qcut(temp_df[col_name], q=[0, 0.1, 0.2, 0.5, 0.7, 0.9, 1.0], retbins=True, duplicates='drop')
+                    if len(bins) < 2: return stats[days_order]
+                    
+                    labels = [f"(%) Drivers RPT Range ({bins[i]:.2f} - {bins[i+1]:.2f})" for i in range(len(bins)-1)]
+                    temp_df['bin'] = pd.cut(temp_df[col_name], bins=bins, labels=labels, include_lowest=True)
+                    dist_df = temp_df.dropna(subset=['bin'])
+                except:
+                    return stats[days_order]
 
-                with st.expander(f"Cluster {cluster_id} ({cluster_colors[cluster_id]}) Coordinates"):
-                    st.text_area("Copy-paste friendly (lat, lng):", coord_text, height=150, key=f"txt_{cluster_id}")
+            # Calculate Percentages
+            grouped = dist_df.groupby(['day of the week', 'bin'], observed=False)['driver_num_treatment'].sum().reset_index()
+            totals = dist_df.groupby('day of the week', observed=False)['driver_num_treatment'].sum().reset_index().rename(columns={'driver_num_treatment': 'total'})
+            merged = pd.merge(grouped, totals, on='day of the week')
+            merged['percent'] = (merged['driver_num_treatment'] / merged['total'] * 100).fillna(0)
+            
+            dist_table = merged.pivot(index='bin', columns='day of the week', values='percent').fillna(0)
+            
+            return pd.concat([stats, dist_table])[days_order]
 
-            # 6. MAP VISUALIZATION
-            st.subheader("Cluster Map")
-            m = folium.Map(location=[temp_df['lat'].mean(), temp_df['lng'].mean()], zoom_start=12)
+        def apply_vivid_style(df):
+            # na_rep=" " replaces NaNs with blanks in the view
+            # subset ensures we only apply gradients to the percentile rows (index 3 and onwards)
+            return df.style.format(precision=2, na_rep=" ") \
+                .background_gradient(cmap='Oranges', subset=pd.IndexSlice[df.index[3:], :]) \
+                .set_properties(**{'color': 'black'})
 
-            # Add markers
-            for _, row in temp_df.iterrows():
-                folium.CircleMarker(
-                    location=[row['lat'], row['lng']],
-                    radius=3,
-                    color=cluster_colors[int(row['cluster'])],
-                    fill=True,
-                    fill_opacity=0.7
-                ).add_to(m)
+        # --- 3. Render Stage Tables ---
+        stages = sorted(working_df['stage'].unique())
+        for stage_num in stages:
+            st.subheader(f"📍 Operational Stage: {stage_num}")
+            stage_df = working_df[working_df['stage'] == stage_num]
+            
+            tph_table = get_metrics_table(stage_df, 'tph', is_rpt=False)
+            rpt_table = get_metrics_table(stage_df, 'rpt', is_rpt=True)
 
-            # Add Polygons
-            for cluster_id, hull in polygons_to_draw:
-                map_coords = [(lat, lng) for lng, lat in hull.exterior.coords]
-                folium.Polygon(
-                    locations=map_coords,
-                    color=cluster_colors[cluster_id],
-                    fill=True,
-                    fill_color=cluster_colors[cluster_id],
-                    fill_opacity=0.3,
-                    weight=3,
-                    popup=f"Geofence {cluster_id}"
-                ).add_to(m)
+            col_left, col_right = st.columns(2)
+            with col_left:
+                if tph_table is not None:
+                    st.markdown(f'<div class="header-block">📈 Stage {stage_num}: TPH Performance</div>', unsafe_allow_html=True)
+                    st.markdown('<div class="content-container">', unsafe_allow_html=True)
+                    st.dataframe(apply_vivid_style(tph_table), use_container_width=True)
+                    st.markdown('</div>', unsafe_allow_html=True)
 
-            st_folium(m, width=700, height=500)
+            with col_right:
+                if rpt_table is not None:
+                    st.markdown(f'<div class="header-block">💰 Stage {stage_num}: RPT Performance</div>', unsafe_allow_html=True)
+                    st.markdown('<div class="content-container">', unsafe_allow_html=True)
+                    st.dataframe(apply_vivid_style(rpt_table), use_container_width=True)
+                    st.markdown('</div>', unsafe_allow_html=True)
+
+        # --- 4. Final Global Summary Tables ---
+        st.divider()
+        summary_base = working_df.groupby(['stage', 'day of the week'], observed=False)[['tph', 'rpt']].mean().reset_index()
+
+        col_sum_left, col_sum_right = st.columns(2)
+
+        with col_sum_left:
+            st.markdown('<div class="header-block">📋 Global Summary: Avg TPH per Day</div>', unsafe_allow_html=True)
+            st.markdown('<div class="content-container">', unsafe_allow_html=True)
+            tph_summary = summary_base.pivot(index='stage', columns='day of the week', values='tph')
+            tph_summary.index = [f"Stage {int(i)}" for i in tph_summary.index]
+            # Convert to styled format before table display
+            st.table(tph_summary.style.format(precision=2, na_rep="-"))
+            st.markdown('</div>', unsafe_allow_html=True)
+
+        with col_sum_right:
+            st.markdown('<div class="header-block">📋 Global Summary: Avg RPT per Day</div>', unsafe_allow_html=True)
+            st.markdown('<div class="content-container">', unsafe_allow_html=True)
+            rpt_summary = summary_base.pivot(index='stage', columns='day of the week', values='rpt')
+            rpt_summary.index = [f"Stage {int(i)}" for i in rpt_summary.index]
+            st.table(rpt_summary.style.format(precision=2, na_rep="-"))
+            st.markdown('</div>', unsafe_allow_html=True)
+
+    except Exception as e:
+        st.error(f"Error processing data: {e}")
+        st.exception(e) # Show full traceback for debugging
+else:
+    st.info("Please upload your Excel file to continue.")
