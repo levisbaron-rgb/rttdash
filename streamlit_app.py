@@ -1,6 +1,7 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import matplotlib
 
 # Force Wide Layout
 st.set_page_config(layout="wide", page_title="DIP Stage Comparison | Use:107183")
